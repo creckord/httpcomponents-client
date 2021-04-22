@@ -26,6 +26,17 @@
  */
 package org.apache.http.impl.auth.win;
 
+import com.sun.jna.platform.win32.Secur32;
+import com.sun.jna.platform.win32.Secur32Util;
+import com.sun.jna.platform.win32.Sspi;
+import com.sun.jna.platform.win32.Sspi.CredHandle;
+import com.sun.jna.platform.win32.Sspi.CtxtHandle;
+import com.sun.jna.platform.win32.Sspi.SecBufferDesc;
+import com.sun.jna.platform.win32.Sspi.TimeStamp;
+import com.sun.jna.platform.win32.SspiUtil.ManagedSecBufferDesc;
+import com.sun.jna.platform.win32.Win32Exception;
+import com.sun.jna.platform.win32.WinError;
+import com.sun.jna.ptr.IntByReference;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -35,7 +46,6 @@ import org.apache.http.HttpRequest;
 import org.apache.http.auth.AUTH;
 import org.apache.http.auth.AuthenticationException;
 import org.apache.http.auth.Credentials;
-import org.apache.http.auth.InvalidCredentialsException;
 import org.apache.http.auth.MalformedChallengeException;
 import org.apache.http.client.config.AuthSchemes;
 import org.apache.http.client.protocol.HttpClientContext;
@@ -44,16 +54,6 @@ import org.apache.http.impl.auth.AuthSchemeBase;
 import org.apache.http.message.BufferedHeader;
 import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.CharArrayBuffer;
-
-import com.sun.jna.platform.win32.Secur32;
-import com.sun.jna.platform.win32.Sspi;
-import com.sun.jna.platform.win32.Sspi.CredHandle;
-import com.sun.jna.platform.win32.Sspi.CtxtHandle;
-import com.sun.jna.platform.win32.Sspi.SecBufferDesc;
-import com.sun.jna.platform.win32.Sspi.TimeStamp;
-import com.sun.jna.platform.win32.Win32Exception;
-import com.sun.jna.platform.win32.WinError;
-import com.sun.jna.ptr.IntByReference;
 
 /**
  * Auth scheme that makes use of JNA to implement Negotiate and NTLM on Windows Platforms.
@@ -71,24 +71,23 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
     private final Log log = LogFactory.getLog(getClass());
 
     // NTLM or Negotiate
-    private final String scheme;
+    private final String schemeName;
     private final String servicePrincipalName;
 
+    private String challenge;
     private CredHandle clientCred;
     private CtxtHandle sspiContext;
     private boolean continueNeeded;
-    private String challenge;
 
-    public WindowsNegotiateScheme(final String scheme, final String servicePrincipalName) {
+    public WindowsNegotiateScheme(final String schemeName, final String servicePrincipalName) {
         super();
 
-        this.scheme = (scheme == null) ? AuthSchemes.SPNEGO : scheme;
-        this.challenge = null;
+        this.schemeName = (schemeName == null) ? AuthSchemes.SPNEGO : schemeName;
         this.continueNeeded = true;
         this.servicePrincipalName = servicePrincipalName;
 
         if (this.log.isDebugEnabled()) {
-            this.log.debug("Created WindowsNegotiateScheme using " + this.scheme);
+            this.log.debug("Created WindowsNegotiateScheme5 using " + this.schemeName);
         }
     }
 
@@ -118,7 +117,12 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
 
     @Override
     public String getSchemeName() {
-        return scheme;
+        return schemeName;
+    }
+
+    @Override
+    public boolean isConnectionBased() {
+        return true;
     }
 
     // String parameters not supported
@@ -127,15 +131,9 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
         return null;
     }
 
-    // NTLM/Negotiate do not support authentication realms
     @Override
     public String getRealm() {
         return null;
-    }
-
-    @Override
-    public boolean isConnectionBased() {
-        return true;
     }
 
     @Override
@@ -155,73 +153,74 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
         }
     }
 
+    /**
+     * Get the SAM-compatible username of the currently logged-on user.
+     *
+     * @return String.
+     */
+    public static String getCurrentUsername() {
+        return CurrentWindowsCredentials.getCurrentUsername();
+    }
+
     @Override
     public Header authenticate(
             final Credentials credentials,
             final HttpRequest request,
             final HttpContext context) throws AuthenticationException {
 
+        final HttpClientContext clientContext = HttpClientContext.adapt(context);
         final String response;
         if (clientCred == null) {
-            // ?? We don't use the credentials, should we allow anything?
-            if (!(credentials instanceof CurrentWindowsCredentials)) {
-                throw new InvalidCredentialsException(
-                        "Credentials cannot be used for " + getSchemeName() + " authentication: "
-                                + credentials.getClass().getName());
-            }
-
             // client credentials handle
             try {
-                final String username = CurrentWindowsCredentials.getCurrentUsername();
+                final String username = getCurrentUsername();
                 final TimeStamp lifetime = new TimeStamp();
 
                 clientCred = new CredHandle();
                 final int rc = Secur32.INSTANCE.AcquireCredentialsHandle(username,
-                        scheme, Sspi.SECPKG_CRED_OUTBOUND, null, null, null, null,
+                        schemeName, Sspi.SECPKG_CRED_OUTBOUND, null, null, null, null,
                         clientCred, lifetime);
 
                 if (WinError.SEC_E_OK != rc) {
                     throw new Win32Exception(rc);
                 }
 
-                final String targetName = getServicePrincipalName(context);
+                final String targetName = getServicePrincipalName(request, clientContext);
                 response = getToken(null, null, targetName);
             } catch (final RuntimeException ex) {
                 failAuthCleanup();
                 if (ex instanceof Win32Exception) {
                     throw new AuthenticationException("Authentication Failed", ex);
-                } else {
-                    throw ex;
                 }
+                throw ex;
             }
-        } else if (this.challenge == null || this.challenge.isEmpty()) {
+        } else if (challenge == null || challenge.isEmpty()) {
             failAuthCleanup();
             throw new AuthenticationException("Authentication Failed");
         } else {
             try {
-                final byte[] continueTokenBytes = Base64.decodeBase64(this.challenge);
-                final SecBufferDesc continueTokenBuffer = new SecBufferDesc(
-                        Sspi.SECBUFFER_TOKEN, continueTokenBytes);
-                final String targetName = getServicePrincipalName(context);
+                final byte[] continueTokenBytes = Base64.decodeBase64(challenge);
+                final SecBufferDesc continueTokenBuffer = new ManagedSecBufferDesc(
+                                Sspi.SECBUFFER_TOKEN, continueTokenBytes);
+                final String targetName = getServicePrincipalName(request, clientContext);
                 response = getToken(this.sspiContext, continueTokenBuffer, targetName);
             } catch (final RuntimeException ex) {
                 failAuthCleanup();
                 if (ex instanceof Win32Exception) {
                     throw new AuthenticationException("Authentication Failed", ex);
-                } else {
-                    throw ex;
                 }
+                throw ex;
             }
         }
 
-        final CharArrayBuffer buffer = new CharArrayBuffer(scheme.length() + 30);
+        final CharArrayBuffer buffer = new CharArrayBuffer(schemeName.length() + 30);
         if (isProxy()) {
             buffer.append(AUTH.PROXY_AUTH_RESP);
         } else {
             buffer.append(AUTH.WWW_AUTH_RESP);
         }
         buffer.append(": ");
-        buffer.append(scheme); // NTLM or Negotiate
+        buffer.append(schemeName); // NTLM or Negotiate
         buffer.append(" ");
         buffer.append(response);
         return new BufferedHeader(buffer);
@@ -237,12 +236,11 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
     // at http://www.chromium.org/developers/design-documents/http-authentication). Here,
     // I've chosen to use the host that has been provided in HttpHost so that I don't incur
     // any additional DNS lookup cost.
-    private String getServicePrincipalName(final HttpContext context) {
-        final String spn;
+    private String getServicePrincipalName(final HttpRequest request, final HttpClientContext clientContext) {
+        String spn = null;
         if (this.servicePrincipalName != null) {
             spn = this.servicePrincipalName;
-        } else if(isProxy()){
-            final HttpClientContext clientContext = HttpClientContext.adapt(context);
+        } else if (isProxy()) {
             final RouteInfo route = clientContext.getHttpRoute();
             if (route != null) {
                 spn = "HTTP/" + route.getProxyHost().getHostName();
@@ -251,7 +249,6 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
                 spn = null;
             }
         } else {
-            final HttpClientContext clientContext = HttpClientContext.adapt(context);
             final HttpHost target = clientContext.getTargetHost();
             if (target != null) {
                 spn = "HTTP/" + target.getHostName();
@@ -277,7 +274,7 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
             final SecBufferDesc continueToken,
             final String targetName) {
         final IntByReference attr = new IntByReference();
-        final SecBufferDesc token = new SecBufferDesc(
+        final ManagedSecBufferDesc token = new ManagedSecBufferDesc(
                 Sspi.SECBUFFER_TOKEN, Sspi.MAX_TOKEN_SIZE);
 
         sspiContext = new CtxtHandle();
@@ -297,7 +294,7 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
                 dispose();
                 throw new Win32Exception(rc);
         }
-        return Base64.encodeBase64String(token.getBytes());
+        return Base64.encodeBase64String(token.getBuffer(0).getBytes());
     }
 
     @Override
