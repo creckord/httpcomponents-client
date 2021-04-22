@@ -27,13 +27,11 @@
 package org.apache.http.impl.auth.win;
 
 import com.sun.jna.platform.win32.Secur32;
-import com.sun.jna.platform.win32.Secur32Util;
 import com.sun.jna.platform.win32.Sspi;
 import com.sun.jna.platform.win32.Sspi.CredHandle;
 import com.sun.jna.platform.win32.Sspi.CtxtHandle;
 import com.sun.jna.platform.win32.Sspi.SecBufferDesc;
 import com.sun.jna.platform.win32.Sspi.TimeStamp;
-import com.sun.jna.platform.win32.SspiUtil.ManagedSecBufferDesc;
 import com.sun.jna.platform.win32.Win32Exception;
 import com.sun.jna.platform.win32.WinError;
 import com.sun.jna.ptr.IntByReference;
@@ -55,6 +53,10 @@ import org.apache.http.message.BufferedHeader;
 import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.CharArrayBuffer;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+
 /**
  * Auth scheme that makes use of JNA to implement Negotiate and NTLM on Windows Platforms.
  * <p>
@@ -69,6 +71,25 @@ import org.apache.http.util.CharArrayBuffer;
 public class WindowsNegotiateScheme extends AuthSchemeBase {
 
     private final Log log = LogFactory.getLog(getClass());
+
+    private static final TokenAccess TOKEN_ACCESS;
+
+    static {
+        TokenAccess ta = null;
+        try {
+            ta = new TokenAccessJna5();
+        } catch (final Exception ex) {
+            //ignore
+        }
+        if (ta == null) {
+            try {
+                ta = new TokenAccessJna4();
+            } catch (final Exception ex) {
+                throw new UnsupportedOperationException("Failed to initialize JNA API", ex);
+            }
+        }
+        TOKEN_ACCESS = ta;
+    }
 
     // NTLM or Negotiate
     private final String schemeName;
@@ -200,7 +221,7 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
         } else {
             try {
                 final byte[] continueTokenBytes = Base64.decodeBase64(challenge);
-                final SecBufferDesc continueTokenBuffer = new ManagedSecBufferDesc(
+                final SecBufferDesc continueTokenBuffer = TOKEN_ACCESS.create(
                                 Sspi.SECBUFFER_TOKEN, continueTokenBytes);
                 final String targetName = getServicePrincipalName(request, clientContext);
                 response = getToken(this.sspiContext, continueTokenBuffer, targetName);
@@ -274,7 +295,7 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
             final SecBufferDesc continueToken,
             final String targetName) {
         final IntByReference attr = new IntByReference();
-        final ManagedSecBufferDesc token = new ManagedSecBufferDesc(
+        final SecBufferDesc token = TOKEN_ACCESS.create(
                 Sspi.SECBUFFER_TOKEN, Sspi.MAX_TOKEN_SIZE);
 
         sspiContext = new CtxtHandle();
@@ -294,7 +315,7 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
                 dispose();
                 throw new Win32Exception(rc);
         }
-        return Base64.encodeBase64String(token.getBuffer(0).getBytes());
+        return Base64.encodeBase64String(TOKEN_ACCESS.getBytes(token));
     }
 
     @Override
@@ -313,4 +334,108 @@ public class WindowsNegotiateScheme extends AuthSchemeBase {
         return authenticate(credentials, request, null);
     }
 
+    private static abstract class TokenAccess {
+
+        abstract SecBufferDesc create(int type, int size);
+        abstract SecBufferDesc create(int type, byte[] token);
+        abstract byte[] getBytes(SecBufferDesc token);
+
+        <T> T safeCreateInstance(final Constructor<T> ctor, final Object... args) {
+            try {
+                return ctor.newInstance(args);
+            } catch (final InstantiationException e) {
+                throw new UnsupportedOperationException(e);
+            } catch (final IllegalAccessException e) {
+                throw new UnsupportedOperationException(e);
+            } catch (final InvocationTargetException e) {
+                final Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new IllegalArgumentException(cause);
+            }
+        }
+
+        Object safeInvoke(final Method m, final Object target, final Object... args) {
+            try {
+                return m.invoke(target, args);
+            } catch (final IllegalAccessException e) {
+                throw new UnsupportedOperationException(e);
+            } catch (final InvocationTargetException e) {
+                final Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new IllegalArgumentException(cause);
+            }
+        }
+    }
+
+    private static final class TokenAccessJna4 extends TokenAccess {
+
+        private final Constructor<SecBufferDesc> sizeCtor;
+        private final Constructor<SecBufferDesc> tokenCtor;
+        private final Method getBytes;
+
+        TokenAccessJna4() {
+            try {
+                sizeCtor = SecBufferDesc.class.getConstructor(int.class, int.class);
+                tokenCtor = SecBufferDesc.class.getConstructor(int.class, byte[].class);
+                getBytes = SecBufferDesc.class.getMethod("getBytes");
+            } catch (final NoSuchMethodException e) {
+                throw new UnsupportedOperationException("JNA 4 API not available", e);
+            }
+        }
+
+        @Override
+        SecBufferDesc create(final int type, final int size) {
+            return safeCreateInstance(sizeCtor, type, size);
+        }
+
+        @Override
+        SecBufferDesc create(final int type, final byte[] token) {
+            return safeCreateInstance(tokenCtor, type, token);
+        }
+
+        @Override
+        byte[] getBytes(final SecBufferDesc token) {
+            return (byte[]) safeInvoke(getBytes, token);
+        }
+    }
+
+    private static final class TokenAccessJna5 extends TokenAccess {
+
+        private final Constructor<?> sizeCtor;
+        private final Constructor<?> tokenCtor;
+        private final Method getBuffer;
+
+        TokenAccessJna5() {
+            try {
+                final Class<?> managedSecBufferDescClass = Class.forName("com.sun.jna.platform.win32.SspiUtil$ManagedSecBufferDesc");
+                sizeCtor = managedSecBufferDescClass.getConstructor(int.class, int.class);
+                tokenCtor = managedSecBufferDescClass.getConstructor(int.class, byte[].class);
+                getBuffer = managedSecBufferDescClass.getMethod("getBuffer", int.class);
+            } catch (final ClassNotFoundException e) {
+                throw new UnsupportedOperationException("JNA 5 API not available", e);
+            } catch (final NoSuchMethodException e) {
+                throw new UnsupportedOperationException("JNA 5 API not available", e);
+            }
+        }
+
+        @Override
+        SecBufferDesc create(final int type, final int size) {
+            return (SecBufferDesc) safeCreateInstance(sizeCtor, type, size);
+        }
+
+        @Override
+        SecBufferDesc create(final int type, final byte[] token) {
+            return (SecBufferDesc) safeCreateInstance(tokenCtor, type, token);
+        }
+
+        @Override
+        byte[] getBytes(final SecBufferDesc token) {
+            final Sspi.SecBuffer buffer = (Sspi.SecBuffer) safeInvoke(getBuffer, token, 0);
+            return buffer.getBytes();
+        }
+    }
 }
